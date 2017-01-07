@@ -245,7 +245,7 @@ public:
                     bst_float h = std::max(p * (1.0f - p), eps);
                     // accumulate gradient and hessian in both pid, and nid
                     gpair[pos.rindex].grad += g * w;
-                    gpair[pos.rindex].hess += 2.0f * w * h;
+                    gpair[pos.rindex].hess += 2.0f * w  * h;
                     gpair[neg.rindex].grad -= g * w;
                     gpair[neg.rindex].hess += 2.0f * w * h;
                 }
@@ -265,9 +265,179 @@ public:
                 gpair[i].hess += (std::max(p * (1.0f - p), 1e-16f)) * w;
             }
 
-            if (!label_correct) {
-                LOG(FATAL) << "label must be in [0, 1] for pairwise and logistic regression";
+            //if (!label_correct) {
+            //    LOG(FATAL) << "label must be in [0, 1] for pairwise and logistic regression";
+            //}
+        }
+    }
+    void PredTransform(std::vector<bst_float> *io_preds) override {
+        std::vector<bst_float> &preds = *io_preds;
+        const bst_omp_uint ndata = static_cast<bst_omp_uint>(preds.size());
+#pragma omp parallel for schedule(static)
+        for (bst_omp_uint j = 0; j < ndata; ++j) {
+            preds[j] = common::Sigmoid(preds[j]);
+        }
+    }
+    const char* DefaultEvalMetric(void) const override {
+        return "map";
+    }
+
+protected:
+    /*! \brief helper information in a list */
+    struct ListEntry {
+        /*! \brief the predict score we in the data */
+        bst_float pred;
+        /*! \brief the actual label of the entry */
+        bst_float label;
+        /*! \brief row index in the data matrix */
+        unsigned rindex;
+        // constructor
+        ListEntry(bst_float pred, bst_float label, unsigned rindex)
+                : pred(pred), label(label), rindex(rindex) {}
+        // comparator by prediction
+        inline static bool CmpPred(const ListEntry &a, const ListEntry &b) {
+            return a.pred > b.pred;
+        }
+        // comparator by label
+        inline static bool CmpLabel(const ListEntry &a, const ListEntry &b) {
+            return a.label > b.label;
+        }
+    };
+    /*! \brief a pair in the lambda rank */
+    struct LambdaPair {
+        /*! \brief positive index: this is a position in the list */
+        unsigned pos_index;
+        /*! \brief negative index: this is a position in the list */
+        unsigned neg_index;
+        /*! \brief weight to be filled in */
+        bst_float weight;
+        // constructor
+        LambdaPair(unsigned pos_index, unsigned neg_index)
+                : pos_index(pos_index), neg_index(neg_index), weight(1.0f) {}
+    };
+    /*!
+     * \brief get lambda weight for existing pairs
+     * \param list a list that is sorted by pred score
+     * \param io_pairs record of pairs, containing the pairs to fill in weights
+     */
+    virtual void GetLambdaWeight(const std::vector<ListEntry> &sorted_list,
+                                 std::vector<LambdaPair> *io_pairs) = 0;
+
+private:
+    LambdaRankParam param_;
+};
+
+// objective for lambda rank
+class LambdaRankAndWeightLogRegObj : public ObjFunction {
+public:
+    void Configure(const std::vector<std::pair<std::string, std::string> >& args) override {
+        param_.InitAllowUnknown(args);
+    }
+    void GetGradient(const std::vector<bst_float>& preds,
+                     const MetaInfo& info,
+                     int iter,
+                     std::vector<bst_gpair>* out_gpair) override {
+        CHECK_EQ(preds.size(), info.labels.size()) << "label size predict size not match";
+        std::vector<bst_gpair>& gpair = *out_gpair;
+        gpair.resize(preds.size());
+        // quick consistency when group is not available
+        std::vector<unsigned> tgptr(2, 0); tgptr[1] = static_cast<unsigned>(info.labels.size());
+        const std::vector<unsigned> &gptr = info.group_ptr.size() == 0 ? tgptr : info.group_ptr;
+        CHECK(gptr.size() != 0 && gptr.back() == info.labels.size())
+            << "group structure not consistent with #rows";
+        const bst_omp_uint ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
+#pragma omp parallel
+        {
+            // parall construct, declare random number generator here, so that each
+            // thread use its own random number generator, seed by thread id and current iteration
+            common::RandomEngine rnd(iter * 1111 + omp_get_thread_num());
+
+            std::vector<LambdaPair> pairs;
+            std::vector<ListEntry>  lst;
+            std::vector< std::pair<bst_float, unsigned> > rec;
+#pragma omp for schedule(static)
+            for (bst_omp_uint k = 0; k < ngroup; ++k) {
+                lst.clear(); pairs.clear();
+                for (unsigned j = gptr[k]; j < gptr[k+1]; ++j) {
+                    lst.push_back(ListEntry(preds[j], info.labels[j], j));
+                    gpair[j] = bst_gpair(0.0f, 0.0f);
+                }
+                std::sort(lst.begin(), lst.end(), ListEntry::CmpPred);
+                rec.resize(lst.size());
+                for (unsigned i = 0; i < lst.size(); ++i) {
+                    rec[i] = std::make_pair(lst[i].label, i);
+                }
+                std::sort(rec.begin(), rec.end(), common::CmpFirst);
+                // enumerate buckets with same label, for each item in the lst, grab another sample randomly
+                for (unsigned i = 0; i < rec.size(); ) {
+                    unsigned j = i + 1;
+                    while (j < rec.size() && rec[j].first == rec[i].first) ++j;
+                    // bucket in [i,j), get a sample outside bucket
+                    unsigned nleft = i, nright = static_cast<unsigned>(rec.size() - j);
+                    if (nleft + nright != 0) {
+                        int nsample = param_.num_pairsample;
+                        while (nsample --) {
+                            for (unsigned pid = i; pid < j; ++pid) {
+                                unsigned ridx = std::uniform_int_distribution<unsigned>(0, nleft + nright - 1)(rnd);
+                                if (ridx < nleft) {
+                                    pairs.push_back(LambdaPair(rec[ridx].second, rec[pid].second));
+                                } else {
+                                    pairs.push_back(LambdaPair(rec[pid].second, rec[ridx+j-i].second));
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                }
+                // get lambda weight for the pairs
+                this->GetLambdaWeight(lst, &pairs);
+                // rescale each gradient and hessian so that the lst have constant weighted
+                float scale = 1.0f / param_.num_pairsample;
+                if (param_.fix_list_weight != 0.0f) {
+                    scale *= param_.fix_list_weight / (gptr[k + 1] - gptr[k]);
+                }
+                for (size_t i = 0; i < pairs.size(); ++i) {
+                    const ListEntry &pos = lst[pairs[i].pos_index];
+                    const ListEntry &neg = lst[pairs[i].neg_index];
+                    const bst_float w = pairs[i].weight * scale;
+                    const float eps = 1e-16f;
+                    bst_float p = common::Sigmoid(pos.pred - neg.pred);
+                    bst_float g = p - 1.0f;
+                    bst_float h = std::max(p * (1.0f - p), eps);
+                    // accumulate gradient and hessian in both pid, and nid
+                    gpair[pos.rindex].grad += g * w;
+                    gpair[pos.rindex].hess += 2.0f * w  * h;
+                    gpair[neg.rindex].grad -= g * w;
+                    gpair[neg.rindex].hess += 2.0f * w * h;
+
+                    //add logistic regression gradient per pair
+                    bst_float posSigmoidPred = common::Sigmoid(pos.pred);//todo: change to template approach later
+                    gpair[pos.rindex].grad += (posSigmoidPred - info.labels[pos.rindex]) * w;
+                    gpair[pos.rindex].hess += (std::max(posSigmoidPred * (1.0f - posSigmoidPred), 1e-16f)) * w;
+
+                    bst_float negSigmoidPred = common::Sigmoid(neg.pred);
+                    gpair[neg.rindex].grad += (negSigmoidPred - info.labels[neg.rindex]) * w;
+                    gpair[neg.rindex].hess += (std::max(negSigmoidPred * (1.0f - negSigmoidPred), 1e-16f)) * w;
+                }
             }
+
+//            //add logistic regression gradient
+//            bool label_correct = true;
+//
+//            const omp_ulong ndata = static_cast<omp_ulong>(preds.size());
+//            for (omp_ulong i = 0; i < ndata; ++i) {
+//                bst_float p = common::Sigmoid(preds[i]);//todo: change to template approach later
+//                bst_float w = info.GetWeight(i);
+//                //if (info.labels[i] == 1.0f) w *= param_.scale_pos_weight;
+//                if (info.labels[i] < 0.0f || info.labels[i] > 1.0f) label_correct = false;
+//
+//                gpair[i].grad += (p - info.labels[i]) * w;
+//                gpair[i].hess += (std::max(p * (1.0f - p), 1e-16f)) * w;
+//            }
+
+            //if (!label_correct) {
+            //    LOG(FATAL) << "label must be in [0, 1] for pairwise and logistic regression";
+            //}
         }
     }
     void PredTransform(std::vector<bst_float> *io_preds) override {
@@ -338,6 +508,13 @@ class PairwiseRankAndLogRegObj: public LambdaRankAndLogRegObj{
  protected:
   void GetLambdaWeight(const std::vector<ListEntry> &sorted_list,
                        std::vector<LambdaPair> *io_pairs) override {}
+};
+
+//template<typename Loss>
+class PairwiseRankAndWeightLogRegObj: public LambdaRankAndWeightLogRegObj{
+protected:
+    void GetLambdaWeight(const std::vector<ListEntry> &sorted_list,
+                         std::vector<LambdaPair> *io_pairs) override {}
 };
 
 // beta version: NDCG lambda rank
@@ -487,6 +664,10 @@ XGBOOST_REGISTER_OBJECTIVE(PairwieRankObj, "rank:pairwise")
 XGBOOST_REGISTER_OBJECTIVE(PairwieRankAndLogRegObj, "rank:pairwiselogreg")
 .describe("Pairwise rank and logistic regression objective.")
 .set_body([]() { return new PairwiseRankAndLogRegObj(); });
+
+XGBOOST_REGISTER_OBJECTIVE(PairwieRankAndWeightLogRegObj, "rank:pairwiseweightlogreg")
+.describe("Pairwise rank and weight logistic regression objective.")
+.set_body([]() { return new PairwiseRankAndWeightLogRegObj(); });
 
 XGBOOST_REGISTER_OBJECTIVE(LambdaRankNDCG, "rank:ndcg")
 .describe("LambdaRank with NDCG as objective.")
