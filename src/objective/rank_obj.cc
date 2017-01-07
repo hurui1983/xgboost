@@ -406,7 +406,7 @@ public:
                     bst_float h = std::max(p * (1.0f - p), eps);
                     // accumulate gradient and hessian in both pid, and nid
                     gpair[pos.rindex].grad += g * w;
-                    gpair[pos.rindex].hess += 2.0f * w  * h;
+                    gpair[pos.rindex].hess += 2.0f * w * h;
                     gpair[neg.rindex].grad -= g * w;
                     gpair[neg.rindex].hess += 2.0f * w * h;
 
